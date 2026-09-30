@@ -141,6 +141,29 @@ class ContinuityDB:
               approved_by INTEGER NOT NULL REFERENCES users(id),
               approved_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS devices (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              device_number TEXT NOT NULL UNIQUE,
+              name TEXT NOT NULL DEFAULT '',
+              registered_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS offline_records (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              device_id INTEGER NOT NULL REFERENCES devices(id),
+              device_number TEXT NOT NULL,
+              continuity_number INTEGER NOT NULL CHECK(continuity_number > 0),
+              record_type TEXT NOT NULL CHECK(record_type IN ('shot_state','exemption')),
+              payload TEXT NOT NULL,
+              base_shot_version INTEGER NOT NULL CHECK(base_shot_version >= 0),
+              status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','merging','merged','pending_verification','failed')),
+              result TEXT,
+              reason TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              merged_at TEXT,
+              UNIQUE(device_id,continuity_number)
+            );
+            CREATE INDEX IF NOT EXISTS idx_offline_records_status ON offline_records(status);
             """
         )
         self.conn.commit()
@@ -381,7 +404,7 @@ class ContinuityDB:
             raise DomainError("冲突不存在或已解决")
         if conflict["status"] != "open":
             raise DomainError("已豁免冲突不能提交状态调整方案")
-        shot = self.conn.execute("SELECT * FROM shots WHERE id=?", (conflict["to_shot_id"],)).fetchone()
+        shot = self.conn.execute("SELECT * FROM shots WHERE id=?", (int(conflict["to_shot_id"]),)).fetchone()
         element = self.conn.execute("SELECT * FROM elements WHERE id=?", (conflict["element_id"],)).fetchone()
         user = self._production_for_user(element["production_id"], user_id)
         if user["role"] not in {"producer", "continuity"}:
@@ -496,4 +519,213 @@ class ContinuityDB:
             "productions": [dict(r) for r in self.conn.execute("SELECT * FROM productions ORDER BY id")],
             "scenes": [dict(r) for r in self.conn.execute("SELECT * FROM scenes ORDER BY production_id,narrative_order")],
             "shots": [dict(r) for r in self.conn.execute("SELECT * FROM shots ORDER BY scene_id,narrative_order")],
+        }
+
+    # ------------------------------------------------------------------
+    # 离线回传与合并
+    # ------------------------------------------------------------------
+
+    def register_device(self, device_number: str, name: str = "") -> int:
+        if not device_number.strip():
+            raise DomainError("设备号不能为空")
+        with self.transaction():
+            try:
+                cur = self.conn.execute(
+                    "INSERT INTO devices(device_number,name,registered_at) VALUES(?,?,?)",
+                    (device_number.strip(), name.strip(), datetime.now().isoformat()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("设备号已注册") from exc
+        return int(cur.lastrowid)
+
+    def list_devices(self) -> list[dict]:
+        return [dict(r) for r in self.conn.execute("SELECT * FROM devices ORDER BY id")]
+
+    def _record_to_dict(self, row: sqlite3.Row) -> dict:
+        d = dict(row)
+        d["payload"] = json.loads(d["payload"]) if d["payload"] else {}
+        d["result"] = json.loads(d["result"]) if d["result"] else None
+        return d
+
+    def upload_offline_record(self, device_id: int, continuity_number: int, record_type: str,
+                              payload: dict, base_shot_version: int) -> dict:
+        """回传一条离线记录。重复回传沿用原结果，不重复写入。"""
+        device = self.conn.execute("SELECT * FROM devices WHERE id=?", (device_id,)).fetchone()
+        if not device:
+            raise DomainError("设备不存在")
+        if record_type not in ("shot_state", "exemption"):
+            raise DomainError("记录类型无效")
+        if continuity_number <= 0 or base_shot_version < 0:
+            raise DomainError("连续编号或镜头版本无效")
+        if not isinstance(payload, dict):
+            raise DomainError("payload 必须是对象")
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM offline_records WHERE device_id=? AND continuity_number=?",
+                (device_id, continuity_number),
+            ).fetchone()
+            if existing:
+                return self._record_to_dict(existing)
+            cur = self.conn.execute(
+                "INSERT INTO offline_records(device_id,device_number,continuity_number,record_type,payload,base_shot_version,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,'pending',?,?)",
+                (device_id, device["device_number"], continuity_number, record_type, payload_json,
+                 base_shot_version, datetime.now().isoformat(), datetime.now().isoformat()),
+            )
+            record_id = int(cur.lastrowid)
+        return self.merge_offline_record(record_id)
+
+    def merge_offline_record(self, record_id: int) -> dict:
+        """合并单条离线记录。已合并或待核对的记录直接返回原结果。"""
+        record = self.conn.execute("SELECT * FROM offline_records WHERE id=?", (record_id,)).fetchone()
+        if not record:
+            raise DomainError("离线记录不存在")
+        if record["status"] in ("merged", "pending_verification", "failed"):
+            return self._record_to_dict(record)
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE offline_records SET status='merging',updated_at=? WHERE id=?",
+                (datetime.now().isoformat(), record_id),
+            )
+        outcome, detail = self._apply_offline_record(record)
+        now = datetime.now().isoformat()
+        if outcome == "merged":
+            with self.transaction():
+                self.conn.execute(
+                    "UPDATE offline_records SET status='merged',result=?,reason='',updated_at=?,merged_at=? WHERE id=?",
+                    (json.dumps(detail, ensure_ascii=False), now, now, record_id),
+                )
+        else:
+            with self.transaction():
+                self.conn.execute(
+                    "UPDATE offline_records SET status='pending_verification',reason=?,result=NULL,updated_at=? WHERE id=?",
+                    (str(detail), now, record_id),
+                )
+        return self._record_to_dict(
+            self.conn.execute("SELECT * FROM offline_records WHERE id=?", (record_id,)).fetchone()
+        )
+
+    def _apply_offline_record(self, record: sqlite3.Row) -> tuple[str, object]:
+        payload = json.loads(record["payload"]) if record["payload"] else {}
+        if record["record_type"] == "shot_state":
+            return self._apply_shot_state(record, payload)
+        return self._apply_exemption(record, payload)
+
+    def _apply_shot_state(self, record: sqlite3.Row, payload: dict) -> tuple[str, object]:
+        shot_id = payload.get("shot_id")
+        element_id = payload.get("element_id")
+        state_value = str(payload.get("state_value", "")).strip()
+        numeric_value = payload.get("numeric_value")
+        note = str(payload.get("note", "")).strip()
+        user_id = payload.get("user_id")
+        if not shot_id or not element_id or not user_id or not state_value:
+            return ("pending_verification", "镜头、元素、用户或状态值缺失")
+        shot = self.conn.execute("SELECT * FROM shots WHERE id=?", (shot_id,)).fetchone()
+        if not shot:
+            return ("pending_verification", "镜头不存在")
+        if shot["version"] != record["base_shot_version"]:
+            return ("pending_verification",
+                    f"镜头已被棚内改动（棚内版本 {shot['version']} ≠ 离线基准 {record['base_shot_version']}）")
+        element = self.conn.execute("SELECT * FROM elements WHERE id=?", (element_id,)).fetchone()
+        if not element:
+            return ("pending_verification", "连续性元素不存在")
+        user = self.conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not user:
+            return ("pending_verification", "用户不存在")
+        try:
+            result = self.set_element_state(int(shot_id), int(element_id), state_value,
+                                            numeric_value, note, int(user_id))
+        except DomainError as exc:
+            return ("pending_verification", str(exc))
+        return ("merged", result)
+
+    def _apply_exemption(self, record: sqlite3.Row, payload: dict) -> tuple[str, object]:
+        conflict_id = payload.get("conflict_id")
+        reason = str(payload.get("reason", "")).strip()
+        user_id = payload.get("user_id")
+        if not conflict_id or not user_id or len(reason) < 8:
+            return ("pending_verification", "冲突、理由或用户缺失")
+        conflict = self.conn.execute("SELECT * FROM conflicts WHERE id=?", (conflict_id,)).fetchone()
+        if not conflict:
+            return ("pending_verification", "冲突不存在")
+        if not conflict["active"]:
+            return ("pending_verification", "冲突已不活跃")
+        if conflict["status"] == "resolved":
+            return ("pending_verification", "冲突已解决，不能改写")
+        if conflict["status"] == "exempted":
+            return ("merged", {"conflict_id": int(conflict_id), "note": "冲突已豁免，未覆盖原豁免"})
+        shot = self.conn.execute("SELECT * FROM shots WHERE id=?", (int(conflict["to_shot_id"]),)).fetchone()
+        if not shot:
+            return ("pending_verification", "冲突对应镜头不存在")
+        if shot["version"] != record["base_shot_version"]:
+            return ("pending_verification",
+                    f"镜头已被棚内改动（版本 {shot['version']} ≠ 基准 {record['base_shot_version']}）")
+        user = self.conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not user:
+            return ("pending_verification", "用户不存在")
+        with self.transaction():
+            self.conn.execute(
+                "INSERT INTO exemptions(conflict_id,reason,approved_by,approved_at) VALUES(?,?,?,?)",
+                (int(conflict_id), reason, int(user_id), datetime.now().isoformat()),
+            )
+            self.conn.execute(
+                "UPDATE conflicts SET status='exempted',updated_at=? WHERE id=?",
+                (datetime.now().isoformat(), int(conflict_id)),
+            )
+        return ("merged", {"conflict_id": int(conflict_id), "status": "exempted"})
+
+    def merge_device_records(self, device_id: int) -> dict:
+        device = self.conn.execute("SELECT * FROM devices WHERE id=?", (device_id,)).fetchone()
+        if not device:
+            raise DomainError("设备不存在")
+        records = self.conn.execute(
+            "SELECT * FROM offline_records WHERE device_id=? AND status IN ('pending','merging') "
+            "ORDER BY continuity_number",
+            (device_id,),
+        ).fetchall()
+        results = {"merged": [], "pending_verification": [], "failed": []}
+        for record in records:
+            outcome = self.merge_offline_record(record["id"])
+            if outcome["status"] == "merged":
+                results["merged"].append(outcome)
+            elif outcome["status"] == "pending_verification":
+                results["pending_verification"].append(outcome)
+            else:
+                results["failed"].append(outcome)
+        return results
+
+    def resume_pending(self) -> dict:
+        """重开服务后继续未做完的条目。"""
+        device_ids = [r["device_id"] for r in self.conn.execute(
+            "SELECT DISTINCT device_id FROM offline_records WHERE status IN ('pending','merging')"
+        ).fetchall()]
+        results = {"merged": [], "pending_verification": [], "failed": []}
+        for device_id in device_ids:
+            outcome = self.merge_device_records(device_id)
+            for key in results:
+                results[key].extend(outcome[key])
+        return results
+
+    def list_offline_records(self, device_id: int | None = None) -> list[dict]:
+        if device_id is not None:
+            rows = self.conn.execute(
+                "SELECT * FROM offline_records WHERE device_id=? ORDER BY continuity_number",
+                (device_id,),
+            ).fetchall()
+        else:
+            rows = self.conn.execute("SELECT * FROM offline_records ORDER BY id").fetchall()
+        return [self._record_to_dict(r) for r in rows]
+
+    def offline_summary(self) -> dict:
+        records = self.list_offline_records()
+        by_status: dict[str, int] = {}
+        for record in records:
+            by_status[record["status"]] = by_status.get(record["status"], 0) + 1
+        return {
+            "total": len(records),
+            "by_status": by_status,
+            "devices": [dict(r) for r in self.conn.execute("SELECT * FROM devices ORDER BY id")],
+            "records": records,
+            "resume_pending": by_status.get("pending", 0) + by_status.get("merging", 0),
         }

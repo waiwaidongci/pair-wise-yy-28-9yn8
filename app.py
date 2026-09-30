@@ -23,6 +23,10 @@ class Handler(BaseHTTPRequestHandler):
             if p.path in ("/","/index.html"):
                 data=(BASE/"static"/"index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data); return
             if p.path=="/api/state": return self._json(200,self.db.snapshot())
+            if p.path=="/api/devices": return self._json(200,{"devices":self.db.list_devices()})
+            if p.path=="/api/offline/records": return self._json(200,{"records":self.db.list_offline_records()})
+            if p.path=="/api/offline/summary": return self._json(200,self.db.offline_summary())
+            if len(parts)==4 and parts[:2]==["api","devices"] and parts[3]=="records": return self._json(200,{"records":self.db.list_offline_records(int(parts[2]))})
             if len(parts)==4 and parts[:2]==["api","productions"] and parts[3]=="continuity": return self._json(200,self.db.continuity_report(int(parts[2])))
             if len(parts)==4 and parts[:2]==["api","scenes"] and parts[3]=="conflicts": return self._json(200,{"conflicts":self.db.list_conflicts(int(parts[2]),True)})
             self._json(404,{"ok":False,"error":"接口不存在"})
@@ -43,8 +47,15 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[:2]==["api","conflicts"] and parts[3]=="plans": return self._json(201,{"ok":True,"id":self.db.propose_adjustment(int(parts[2]),str(b.get("new_value","")),b.get("numeric_value"),str(b.get("reason","")),int(b.get("user_id",0)))})
             if len(parts)==4 and parts[:2]==["api","conflicts"] and parts[3]=="exemptions": return self._json(201,{"ok":True,"id":self.db.approve_exemption(int(parts[2]),str(b.get("reason","")),int(b.get("reviewer_id",0)))})
             if len(parts)==4 and parts[:2]==["api","plans"] and parts[3]=="review": return self._json(200,{"ok":True,**self.db.review_adjustment(int(parts[2]),bool(b.get("approve",False)),int(b.get("reviewer_id",0)),str(b.get("note","")))})
+            if path=="/api/devices": return self._json(201,{"ok":True,"id":self.db.register_device(str(b.get("device_number","")),str(b.get("name","")))})
+            if path=="/api/offline/resume": return self._json(200,{"ok":True,**self.db.resume_pending()})
+            if len(parts)==4 and parts[:2]==["api","devices"] and parts[3]=="records": return self._json(201,{"ok":True,"record":self.db.upload_offline_record(int(parts[2]),int(b.get("continuity_number",0)),str(b.get("record_type","")),b.get("payload",{}),int(b.get("base_shot_version",0)))})
+            if len(parts)==4 and parts[:2]==["api","devices"] and parts[3]=="merge": return self._json(200,{"ok":True,**self.db.merge_device_records(int(parts[2]))})
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
 def main():
-    ContinuityDB(DB_PATH).seed_demo(); port=int(os.environ.get("PORT","8115")); print(f"Film continuity service: http://127.0.0.1:{port}"); ThreadingHTTPServer(("0.0.0.0",port),Handler).serve_forever()
+    db=ContinuityDB(DB_PATH); db.seed_demo()
+    try: db.resume_pending()
+    except Exception as exc: print(f"续传失败: {exc}")
+    port=int(os.environ.get("PORT","8115")); print(f"Film continuity service: http://127.0.0.1:{port}"); ThreadingHTTPServer(("0.0.0.0",port),Handler).serve_forever()
 if __name__=="__main__": main()
