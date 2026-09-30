@@ -23,6 +23,13 @@ class Handler(BaseHTTPRequestHandler):
             if p.path in ("/","/index.html"):
                 data=(BASE/"static"/"index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data); return
             if p.path=="/api/state": return self._json(200,self.db.snapshot())
+            if p.path=="/api/sync/progress": return self._json(200,self.db.sync_progress())
+            if p.path=="/api/sync/entries":
+                qs=parse_qs(p.query); device=qs.get("device",[""])[0].strip() or None
+                status=qs.get("status",[""])[0].strip() or None
+                if status not in (None,"pending","merged","review"): raise DomainError("状态筛选无效")
+                return self._json(200,self.db.list_sync_entries(device,status))
+            if p.path=="/api/sync/review": return self._json(200,self.db.list_sync_entries(None,"review"))
             if len(parts)==4 and parts[:2]==["api","productions"] and parts[3]=="continuity": return self._json(200,self.db.continuity_report(int(parts[2])))
             if len(parts)==4 and parts[:2]==["api","scenes"] and parts[3]=="conflicts": return self._json(200,{"conflicts":self.db.list_conflicts(int(parts[2]),True)})
             self._json(404,{"ok":False,"error":"接口不存在"})
@@ -43,8 +50,14 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts)==4 and parts[:2]==["api","conflicts"] and parts[3]=="plans": return self._json(201,{"ok":True,"id":self.db.propose_adjustment(int(parts[2]),str(b.get("new_value","")),b.get("numeric_value"),str(b.get("reason","")),int(b.get("user_id",0)))})
             if len(parts)==4 and parts[:2]==["api","conflicts"] and parts[3]=="exemptions": return self._json(201,{"ok":True,"id":self.db.approve_exemption(int(parts[2]),str(b.get("reason","")),int(b.get("reviewer_id",0)))})
             if len(parts)==4 and parts[:2]==["api","plans"] and parts[3]=="review": return self._json(200,{"ok":True,**self.db.review_adjustment(int(parts[2]),bool(b.get("approve",False)),int(b.get("reviewer_id",0)),str(b.get("note","")))})
+            if path=="/api/sync/batch": return self._json(200,{"ok":True,**self.db.sync_batch(str(b.get("device_id","")),b.get("entries",[]))})
+            if path=="/api/sync/resume":
+                device=b.get("device_id",None)
+                return self._json(200,{"ok":True,**self.db.resume_sync(str(device) if device not in (None,"") else None)})
             self._json(404,{"ok":False,"error":"接口不存在"})
         except (DomainError,ValueError) as exc: self._json(400,{"ok":False,"error":str(exc)})
 def main():
-    ContinuityDB(DB_PATH).seed_demo(); port=int(os.environ.get("PORT","8115")); print(f"Film continuity service: http://127.0.0.1:{port}"); ThreadingHTTPServer(("0.0.0.0",port),Handler).serve_forever()
+    db=ContinuityDB(DB_PATH); db.seed_demo(); resumed=db.resume_sync()
+    pending=sum(d["pending"] for d in resumed["devices"])
+    port=int(os.environ.get("PORT","8115")); print(f"Film continuity service: http://127.0.0.1:{port}（续传后仍有待处理条目 {pending} 条）"); ThreadingHTTPServer(("0.0.0.0",port),Handler).serve_forever()
 if __name__=="__main__": main()

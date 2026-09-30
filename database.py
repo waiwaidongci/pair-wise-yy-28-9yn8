@@ -141,6 +141,21 @@ class ContinuityDB:
               approved_by INTEGER NOT NULL REFERENCES users(id),
               approved_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS sync_entries (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              device_id TEXT NOT NULL,
+              seq INTEGER NOT NULL CHECK(seq >= 0),
+              shot_id INTEGER NOT NULL REFERENCES shots(id),
+              base_version INTEGER NOT NULL CHECK(base_version >= 0),
+              kind TEXT NOT NULL CHECK(kind IN ('state','exemption')),
+              payload TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','merged','review')),
+              result TEXT NOT NULL DEFAULT '',
+              error TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              processed_at TEXT,
+              UNIQUE(device_id,seq)
+            );
             """
         )
         self.conn.commit()
@@ -272,20 +287,27 @@ class ContinuityDB:
         if element["rule"] == "monotonic" and numeric_value is None:
             raise DomainError("单调规则必须提供 numeric_value")
         with self.transaction():
-            try:
-                self.conn.execute(
-                    "INSERT INTO element_states(shot_id,element_id,state_value,numeric_value,note,updated_by,updated_at) "
-                    "VALUES(?,?,?,?,?,?,?)",
-                    (shot_id, element_id, state_value.strip(), numeric_value, note.strip(), user_id, datetime.now().isoformat()),
-                )
-            except sqlite3.IntegrityError:
-                self.conn.execute(
-                    "UPDATE element_states SET state_value=?,numeric_value=?,note=?,updated_by=?,updated_at=? WHERE shot_id=? AND element_id=?",
-                    (state_value.strip(), numeric_value, note.strip(), user_id, datetime.now().isoformat(), shot_id, element_id),
-                )
-            self.conn.execute("UPDATE shots SET version=version+1,updated_by=?,updated_at=? WHERE id=?", (user_id, datetime.now().isoformat(), shot_id))
-            self._sync_conflicts(shot["scene_id"])
-        return {"shot_id": shot_id, "element_id": element_id, "conflicts": self.list_conflicts(shot["scene_id"])}
+            conflicts = self._write_element_state(shot, element, state_value, numeric_value, note, user_id)
+        return {"shot_id": shot_id, "element_id": element_id, "conflicts": conflicts}
+
+    def _write_element_state(self, shot: sqlite3.Row, element: sqlite3.Row, state_value: str,
+                             numeric_value: float | None, note: str, user_id: int) -> list[dict]:
+        """在已开启的事务内写入元素状态、提升镜头版本并同步冲突。"""
+        now = datetime.now().isoformat()
+        try:
+            self.conn.execute(
+                "INSERT INTO element_states(shot_id,element_id,state_value,numeric_value,note,updated_by,updated_at) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (shot["id"], element["id"], state_value.strip(), numeric_value, note.strip(), user_id, now),
+            )
+        except sqlite3.IntegrityError:
+            self.conn.execute(
+                "UPDATE element_states SET state_value=?,numeric_value=?,note=?,updated_by=?,updated_at=? WHERE shot_id=? AND element_id=?",
+                (state_value.strip(), numeric_value, note.strip(), user_id, now, shot["id"], element["id"]),
+            )
+        self.conn.execute("UPDATE shots SET version=version+1,updated_by=?,updated_at=? WHERE id=?", (user_id, now, shot["id"]))
+        self._sync_conflicts(shot["scene_id"])
+        return self.list_conflicts(shot["scene_id"])
 
     def _detect_conflicts(self, scene_id: int) -> list[dict]:
         scene = self.conn.execute("SELECT * FROM scenes WHERE id=?", (scene_id,)).fetchone()
@@ -422,16 +444,11 @@ class ContinuityDB:
                 (status, reviewer_id, note.strip(), datetime.now().isoformat(), plan_id),
             )
             if approve:
-                try:
-                    self.conn.execute(
-                        "INSERT INTO element_states(shot_id,element_id,state_value,numeric_value,note,updated_by,updated_at) VALUES(?,?,?,?,?,?,?)",
-                        (plan["shot_id"], plan["element_id"], plan["new_value"], plan["numeric_value"], f"调整方案 #{plan_id}", reviewer_id, datetime.now().isoformat()),
-                    )
-                except sqlite3.IntegrityError:
-                    self.conn.execute(
-                        "UPDATE element_states SET state_value=?,numeric_value=?,note=?,updated_by=?,updated_at=? WHERE shot_id=? AND element_id=?",
-                        (plan["new_value"], plan["numeric_value"], f"调整方案 #{plan_id}", reviewer_id, datetime.now().isoformat(), plan["shot_id"], plan["element_id"]),
-                    )
+                element = self.conn.execute("SELECT * FROM elements WHERE id=?", (plan["element_id"],)).fetchone()
+                self._write_element_state(
+                    shot, element, plan["new_value"], plan["numeric_value"],
+                    f"调整方案 #{plan_id}", reviewer_id,
+                )
                 self.conn.execute(
                     "UPDATE conflicts SET active=0,status='resolved',updated_at=? WHERE id=?",
                     (datetime.now().isoformat(), plan["conflict_id"]),
@@ -447,14 +464,19 @@ class ContinuityDB:
         if len(reason.strip()) < 8:
             raise DomainError("豁免理由至少8个字符")
         with self.transaction():
-            try:
-                cur = self.conn.execute(
-                    "INSERT INTO exemptions(conflict_id,reason,approved_by,approved_at) VALUES(?,?,?,?)",
-                    (conflict_id, reason.strip(), reviewer_id, datetime.now().isoformat()),
-                )
-            except sqlite3.IntegrityError as exc:
-                raise DomainError("该冲突已经豁免") from exc
-            self.conn.execute("UPDATE conflicts SET status='exempted',updated_at=? WHERE id=?", (datetime.now().isoformat(), conflict_id))
+            exemption_id = self._write_exemption(conflict, reason, reviewer_id)
+        return exemption_id
+
+    def _write_exemption(self, conflict: sqlite3.Row, reason: str, reviewer_id: int) -> int:
+        """在已开启的事务内写入豁免（UNIQUE 冲突说明已豁免）。"""
+        try:
+            cur = self.conn.execute(
+                "INSERT INTO exemptions(conflict_id,reason,approved_by,approved_at) VALUES(?,?,?,?)",
+                (conflict["id"], reason.strip(), reviewer_id, datetime.now().isoformat()),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise DomainError("该冲突已经豁免") from exc
+        self.conn.execute("UPDATE conflicts SET status='exempted',updated_at=? WHERE id=?", (datetime.now().isoformat(), conflict["id"]))
         return int(cur.lastrowid)
 
     def lock_shot(self, shot_id: int, user_id: int) -> None:
@@ -497,3 +519,265 @@ class ContinuityDB:
             "scenes": [dict(r) for r in self.conn.execute("SELECT * FROM scenes ORDER BY production_id,narrative_order")],
             "shots": [dict(r) for r in self.conn.execute("SELECT * FROM shots ORDER BY scene_id,narrative_order")],
         }
+
+    # ------------------------------------------------------------------
+    # 离线回传合并：设备号 + 连续编号保证幂等，镜头版本做乐观锁
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sync_int(value, message: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise DomainError(message)
+        return value
+
+    def _validate_sync_entry(self, entry) -> dict:
+        if not isinstance(entry, dict):
+            raise DomainError("回传条目必须是对象")
+        kind = entry.get("kind")
+        if kind not in {"state", "exemption"}:
+            raise DomainError("回传条目类型必须是 state 或 exemption")
+        shot_id = self._sync_int(entry.get("shot_id"), "镜头 ID 必须是整数")
+        base_version = self._sync_int(entry.get("base_version"), "镜头版本必须是整数")
+        if shot_id <= 0 or base_version < 0:
+            raise DomainError("镜头 ID 或版本无效")
+        shot = self.conn.execute("SELECT * FROM shots WHERE id=?", (shot_id,)).fetchone()
+        if not shot:
+            raise DomainError(f"镜头 {shot_id} 不存在")
+        payload = {}
+        if kind == "state":
+            element_id = self._sync_int(entry.get("element_id"), "元素 ID 必须是整数")
+            state_value = entry.get("state_value", "")
+            numeric_value = entry.get("numeric_value")
+            note = entry.get("note", "")
+            user_id = self._sync_int(entry.get("user_id"), "记录人 ID 必须是整数")
+            if not isinstance(state_value, str) or not state_value.strip():
+                raise DomainError("状态值不能为空")
+            if numeric_value is not None and (isinstance(numeric_value, bool) or not isinstance(numeric_value, (int, float))):
+                raise DomainError("numeric_value 必须是数字")
+            if not isinstance(note, str):
+                raise DomainError("备注必须是字符串")
+            element = self.conn.execute("SELECT * FROM elements WHERE id=?", (element_id,)).fetchone()
+            scene = self.conn.execute("SELECT production_id FROM scenes WHERE id=?", (shot["scene_id"],)).fetchone()
+            if not element or not scene or element["production_id"] != scene["production_id"]:
+                raise DomainError("镜头与元素不属于同一项目")
+            self._production_for_user(scene["production_id"], user_id)
+            if element["rule"] == "monotonic" and numeric_value is None:
+                raise DomainError("单调规则必须提供 numeric_value")
+            if shot["status"] == "locked":
+                raise DomainError("镜头已锁定，不能直接修改状态")
+            payload = {"element_id": element_id, "state_value": state_value,
+                       "numeric_value": numeric_value, "note": note, "user_id": user_id}
+        else:
+            conflict_id = self._sync_int(entry.get("conflict_id"), "冲突 ID 必须是整数")
+            reason = entry.get("reason", "")
+            reviewer_id = self._sync_int(entry.get("reviewer_id"), "审片人 ID 必须是整数")
+            if not isinstance(reason, str) or len(reason.strip()) < 8:
+                raise DomainError("豁免理由至少8个字符")
+            reviewer = self.conn.execute("SELECT role FROM users WHERE id=?", (reviewer_id,)).fetchone()
+            if not reviewer or reviewer["role"] != "reviewer":
+                raise DomainError("冲突或审片人无效")
+            conflict = self.conn.execute("SELECT * FROM conflicts WHERE id=?", (conflict_id,)).fetchone()
+            if not conflict or not conflict["active"]:
+                raise DomainError("冲突不存在或已解决")
+            if conflict["to_shot_id"] != shot_id:
+                raise DomainError("豁免条目与镜头不匹配")
+            payload = {"conflict_id": conflict_id, "reason": reason, "reviewer_id": reviewer_id}
+        return {"kind": kind, "shot_id": shot_id, "base_version": base_version,
+                "payload": payload, "shot": shot}
+
+    def sync_batch(self, device_id: str, entries: list) -> dict:
+        device_id = str(device_id or "").strip()
+        if not device_id:
+            raise DomainError("设备号不能为空")
+        if not isinstance(entries, list) or not entries:
+            raise DomainError("回传条目不能为空")
+        seqs: set[int] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise DomainError("回传条目必须是对象")
+            seq = self._sync_int(entry.get("seq"), "连续编号必须是整数")
+            if seq < 0 or seq in seqs:
+                raise DomainError("同批次连续编号缺失或重复")
+            seqs.add(seq)
+        prepared = [self._validate_sync_entry(e) for e in entries]
+        now = datetime.now().isoformat()
+        with self.transaction():
+            for entry, valid in zip(entries, prepared):
+                try:
+                    self.conn.execute(
+                        "INSERT INTO sync_entries(device_id,seq,shot_id,base_version,kind,payload,created_at) "
+                        "VALUES(?,?,?,?,?,?,?)",
+                        (device_id, entry["seq"], valid["shot_id"], valid["base_version"],
+                         valid["kind"], json.dumps(valid["payload"], ensure_ascii=False), now),
+                    )
+                except sqlite3.IntegrityError:
+                    # 同设备同编号重复回传：沿用原条目，不覆盖任何内容
+                    pass
+        # 条目已逐条落盘，处理时每条独立事务，中断后可从 pending 条目续走
+        blocked = self._process_device(device_id)
+        return {"device_id": device_id, "results": self._device_entries(device_id),
+                "blocked_seq": blocked, **self._device_progress(device_id)}
+
+    def _device_entries(self, device_id: str) -> list[dict]:
+        rows = self.conn.execute(
+            "SELECT * FROM sync_entries WHERE device_id=? ORDER BY seq", (device_id,)
+        ).fetchall()
+        return [self._entry_dict(r) for r in rows]
+
+    def _process_device(self, device_id: str) -> int | None:
+        """按连续编号处理该设备所有待处理条目；条目级独立事务，失败即停在该处等待续传。"""
+        while True:
+            row = self.conn.execute(
+                "SELECT * FROM sync_entries WHERE device_id=? AND status='pending' ORDER BY seq LIMIT 1",
+                (device_id,),
+            ).fetchone()
+            if not row:
+                return None
+            try:
+                outcome = self._merge_entry(row)
+            except DomainError as exc:
+                with self.transaction():
+                    self.conn.execute("UPDATE sync_entries SET error=? WHERE id=?", (str(exc), row["id"]))
+                return row["seq"]
+            with self.transaction():
+                self.conn.execute(
+                    "UPDATE sync_entries SET status=?,result=?,error='',processed_at=? WHERE id=?",
+                    (outcome["status"], json.dumps(outcome, ensure_ascii=False),
+                     datetime.now().isoformat(), row["id"]),
+                )
+
+    def _merge_entry(self, row: sqlite3.Row) -> dict:
+        shot = self.conn.execute("SELECT * FROM shots WHERE id=?", (row["shot_id"],)).fetchone()
+        payload = json.loads(row["payload"])
+        if not shot:
+            return {"status": "review", "reason": "shot_missing",
+                    "message": "镜头已不存在，留待人工核对"}
+        if shot["version"] != row["base_version"]:
+            # 棚内已改动该镜头：绝不回写，留为待核对
+            return {"status": "review", "reason": "version_mismatch",
+                    "message": f"镜头版本已从 {row['base_version']} 变为 {shot['version']}，棚内已有改动",
+                    "server_version": shot["version"]}
+        if row["kind"] == "state":
+            return self._merge_state_entry(row, shot, payload)
+        return self._merge_exemption_entry(row, shot, payload)
+
+    def _merge_state_entry(self, row: sqlite3.Row, shot: sqlite3.Row, payload: dict) -> dict:
+        element = self.conn.execute("SELECT * FROM elements WHERE id=?", (payload["element_id"],)).fetchone()
+        if not element:
+            return {"status": "review", "reason": "element_missing", "message": "连续性元素已不存在，留待人工核对"}
+        if shot["status"] == "locked":
+            return {"status": "review", "reason": "shot_locked", "message": "镜头已锁定，任何离线写入都留待人工核对"}
+        with self.transaction():
+            # 事务内复查版本，防止与棚内修改并发互相覆盖
+            current = self.conn.execute("SELECT version FROM shots WHERE id=?", (shot["id"],)).fetchone()
+            if current["version"] != row["base_version"]:
+                return {"status": "review", "reason": "version_mismatch",
+                        "message": f"镜头版本已从 {row['base_version']} 变为 {current['version']}，棚内已有改动",
+                        "server_version": current["version"]}
+            conflicts = self._write_element_state(
+                shot, element, payload["state_value"], payload["numeric_value"],
+                payload["note"], payload["user_id"],
+            )
+        return {"status": "merged", "kind": "state", "shot_id": shot["id"],
+                "shot_code": shot["shot_code"], "element_id": element["id"],
+                "applied_version": row["base_version"] + 1,
+                "open_conflicts": sum(1 for c in conflicts if c["active"] and c["status"] == "open")}
+
+    def _merge_exemption_entry(self, row: sqlite3.Row, shot: sqlite3.Row, payload: dict) -> dict:
+        conflict = self.conn.execute("SELECT * FROM conflicts WHERE id=?", (payload["conflict_id"],)).fetchone()
+        if not conflict or not conflict["active"]:
+            return {"status": "review", "reason": "conflict_missing",
+                    "message": "冲突不存在或已解决，留待人工核对"}
+        if conflict["status"] != "open":
+            return {"status": "review", "reason": "conflict_not_open",
+                    "message": f"冲突当前状态为 {conflict['status']}，不能再写入豁免"}
+        if conflict["to_shot_id"] != shot["id"]:
+            return {"status": "review", "reason": "shot_mismatch", "message": "豁免条目与镜头不匹配"}
+        with self.transaction():
+            current = self.conn.execute("SELECT version FROM shots WHERE id=?", (shot["id"],)).fetchone()
+            if current["version"] != row["base_version"]:
+                return {"status": "review", "reason": "version_mismatch",
+                        "message": f"镜头版本已从 {row['base_version']} 变为 {current['version']}，棚内已有改动",
+                        "server_version": current["version"]}
+            exemption_id = self._write_exemption(conflict, payload["reason"], payload["reviewer_id"])
+        return {"status": "merged", "kind": "exemption", "shot_id": shot["id"],
+                "shot_code": shot["shot_code"], "conflict_id": conflict["id"],
+                "exemption_id": exemption_id, "applied_version": shot["version"]}
+
+    def resume_sync(self, device_id: str | None = None) -> dict:
+        """中断后重开服务时调用：从未完成条目接着处理。"""
+        if device_id is not None:
+            device_id = str(device_id).strip()
+            if not device_id:
+                raise DomainError("设备号不能为空")
+            device_ids = [device_id]
+        else:
+            device_ids = [r["device_id"] for r in self.conn.execute(
+                "SELECT DISTINCT device_id FROM sync_entries WHERE status='pending' ORDER BY device_id"
+            ).fetchall()]
+        devices = []
+        for dev in device_ids:
+            blocked = self._process_device(dev)
+            devices.append({"device_id": dev, "blocked_seq": blocked, **self._device_progress(dev)})
+        return {"devices": devices}
+
+    def _device_progress(self, device_id: str) -> dict:
+        stats = self.conn.execute(
+            "SELECT status,COUNT(*) AS n,COALESCE(MAX(seq),-1) AS max_seq FROM sync_entries WHERE device_id=? GROUP BY status",
+            (device_id,),
+        ).fetchall()
+        by_status = {r["status"]: r["n"] for r in stats}
+        total = sum(by_status.values())
+        last_seq = max((r["max_seq"] for r in stats), default=-1)
+        return {"total": total, "pending": by_status.get("pending", 0),
+                "merged": by_status.get("merged", 0), "review": by_status.get("review", 0),
+                "last_seq": last_seq}
+
+    def sync_progress(self) -> dict:
+        rows = self.conn.execute(
+            "SELECT device_id,status,COUNT(*) AS n,COALESCE(MAX(seq),-1) AS max_seq "
+            "FROM sync_entries GROUP BY device_id,status ORDER BY device_id"
+        ).fetchall()
+        devices: dict[str, dict] = {}
+        for row in rows:
+            dev = devices.setdefault(row["device_id"], {"device_id": row["device_id"], "total": 0,
+                                       "pending": 0, "merged": 0, "review": 0, "last_seq": -1})
+            dev[row["status"]] = row["n"]
+            dev["total"] += row["n"]
+            dev["last_seq"] = max(dev["last_seq"], row["max_seq"])
+        blocked = self.conn.execute(
+            "SELECT device_id,MIN(seq) AS seq FROM sync_entries WHERE status='pending' GROUP BY device_id"
+        ).fetchall()
+        blocked_map = {r["device_id"]: r["seq"] for r in blocked}
+        for dev in devices.values():
+            dev["blocked_seq"] = blocked_map.get(dev["device_id"])
+        return {"devices": sorted(devices.values(), key=lambda d: d["device_id"])}
+
+    def _entry_dict(self, row: sqlite3.Row) -> dict:
+        shot = self.conn.execute(
+            "SELECT s.shot_code,s.scene_id,sc.scene_number FROM shots s "
+            "JOIN scenes sc ON sc.id=s.scene_id WHERE s.id=?", (row["shot_id"],)
+        ).fetchone()
+        result = json.loads(row["result"]) if row["result"] else None
+        return {
+            "id": row["id"], "device_id": row["device_id"], "seq": row["seq"],
+            "shot_id": row["shot_id"], "shot_code": shot["shot_code"] if shot else None,
+            "scene_number": shot["scene_number"] if shot else None,
+            "base_version": row["base_version"], "kind": row["kind"],
+            "payload": json.loads(row["payload"]), "status": row["status"],
+            "result": result, "error": row["error"],
+            "created_at": row["created_at"], "processed_at": row["processed_at"],
+        }
+
+    def list_sync_entries(self, device_id: str | None = None, status_filter: str | None = None) -> dict:
+        sql = "SELECT * FROM sync_entries"
+        where, params = [], []
+        if device_id:
+            where.append("device_id=?"); params.append(device_id)
+        if status_filter:
+            where.append("status=?"); params.append(status_filter)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY device_id,seq"
+        entries = [self._entry_dict(r) for r in self.conn.execute(sql, params).fetchall()]
+        return {"entries": entries, **self.sync_progress()}
